@@ -1,32 +1,91 @@
 from __future__ import annotations
-import numpy as np; import pandas as pd
-FEATURE_NAMES = ["mean_iou","per_class_iou_vehicle","per_class_iou_pedestrian","per_class_iou_road","dice_coeff","boundary_f1","edge_intensity","texture_variance","road_area_pct","horizon_position","weather_score","lighting_score","frame_blur","depth_variance"]
-CATEGORICAL_FEATURES = ["weather_score"]
-NUMERICAL_FEATURES = ["mean_iou","per_class_iou_vehicle","per_class_iou_pedestrian","per_class_iou_road","dice_coeff","boundary_f1","edge_intensity","texture_variance","road_area_pct","horizon_position","lighting_score","frame_blur","depth_variance"]
-TARGET_NAME = "hazard_detected"
-def make_synthetic(n=10000,seed=42):
-    rng=np.random.default_rng(seed)
-    df=pd.DataFrame({
-        "mean_iou": rng.beta(6,3,size=n).round(3),
-        "per_class_iou_vehicle": rng.beta(5,4,size=n).round(3),
-        "per_class_iou_pedestrian": rng.beta(4,5,size=n).round(3),
-        "per_class_iou_road": rng.beta(8,2,size=n).round(3),
-        "dice_coeff": rng.beta(7,2,size=n).round(3),
-        "boundary_f1": rng.beta(5,3,size=n).round(3),
-        "edge_intensity": rng.uniform(0,100,size=n).round(1),
-        "texture_variance": rng.uniform(0,100,size=n).round(1),
-        "road_area_pct": rng.beta(6,2,size=n).round(3),
-        "horizon_position": rng.uniform(0.3,0.7,size=n).round(3),
-        "weather_score": rng.choice([1,2,3,4,5],size=n,p=[0.30,0.30,0.20,0.12,0.08]),
-        "lighting_score": rng.uniform(0,100,size=n).round(1),
-        "frame_blur": rng.beta(2,8,size=n).round(3),
-        "depth_variance": rng.uniform(0,100,size=n).round(1),
-    })
-    miou=df["mean_iou"]; iou_veh=df["per_class_iou_vehicle"]; iou_ped=df["per_class_iou_pedestrian"]
-    iou_road=df["per_class_iou_road"]; dice=df["dice_coeff"]; bf1=df["boundary_f1"]
-    road=df["road_area_pct"]; edge=df["edge_intensity"]/100; tex=df["texture_variance"]/100
-    weather=df["weather_score"]/5; light=df["lighting_score"]/100; blur=df["frame_blur"]
-    depth=df["depth_variance"]/100
-    log_odds = -2.5 - 0.5*miou - 0.3*iou_veh + 0.6*(1-iou_ped) - 0.2*iou_road - 0.4*dice - 0.3*bf1 + 0.3*edge + 0.2*tex - 0.2*road + 0.1*weather - 0.2*light + 0.4*blur + 0.3*depth + rng.normal(0,0.5,size=n)
-    prob=1/(1+np.exp(-log_odds)); y=(prob>np.percentile(prob,85)).astype(np.float64)
-    return {"X":df,"y":y,"features":FEATURE_NAMES,"df":df.assign(hazard_detected=y),"categorical_features":CATEGORICAL_FEATURES,"numerical_features":NUMERICAL_FEATURES,"n_samples":n,"n_features":len(FEATURE_NAMES),"positive_rate":y.mean()}
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+
+CLASS_NAMES = ["background", "road", "vehicle", "pedestrian"]
+NUM_CLASSES = 4
+IMG_SIZE = 128
+
+def _draw_road(mask, rng):
+    h, w = mask.shape
+    road_top = int(h * rng.uniform(0.35, 0.55))
+    road_left = int(w * rng.uniform(0.0, 0.15))
+    road_right = int(w * rng.uniform(0.85, 1.0))
+    rr, cc = np.mgrid[road_top:h, road_left:road_right]
+    mask[rr, cc] = 1
+
+def _draw_vehicle(mask, rng):
+    h, w = mask.shape
+    for _ in range(rng.integers(1, 5)):
+        vh = rng.integers(12, 25)
+        vw = rng.integers(20, 35)
+        vy = rng.integers(int(h * 0.25), h - vh - 5)
+        vx = rng.integers(0, w - vw)
+        rr, cc = np.mgrid[vy:vy + vh, vx:vx + vw]
+        region = mask[rr, cc]
+        region[(region != 1)] = 2
+
+def _draw_pedestrian(mask, rng):
+    h, w = mask.shape
+    for _ in range(rng.integers(0, 4)):
+        ph = rng.integers(8, 16)
+        pw = rng.integers(4, 8)
+        py = rng.integers(int(h * 0.35), h - ph - 3)
+        px = rng.integers(0, w - pw)
+        rr, cc = np.mgrid[py:py + ph, px:px + pw]
+        region = mask[rr, cc]
+        region[(region != 1)] = 3
+
+def _render_image(mask, rng):
+    h, w = mask.shape
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    colors = {0: (87, 87, 87), 1: (80, 80, 80), 2: (60, 60, 140), 3: (140, 60, 60)}
+    for cls, color in colors.items():
+        img[mask == cls] = color
+    noise = rng.normal(0, 12, img.shape).astype(np.int16)
+    img = np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+    return img
+
+def make_synthetic(n=1000, seed=42, img_size=IMG_SIZE):
+    rng = np.random.default_rng(seed)
+    images, masks = [], []
+    for _ in range(n):
+        mask = np.zeros((img_size, img_size), dtype=np.int64)
+        _draw_road(mask, rng)
+        _draw_vehicle(mask, rng)
+        _draw_pedestrian(mask, rng)
+        img = _render_image(mask, rng)
+        images.append(torch.from_numpy(img).permute(2, 0, 1).float() / 127.5 - 1.0)
+        masks.append(torch.from_numpy(mask).long())
+    data = {
+        "images": torch.stack(images),
+        "masks": torch.stack(masks),
+        "class_names": CLASS_NAMES,
+        "num_classes": NUM_CLASSES,
+        "n_samples": n,
+    }
+    return data
+
+class SegmentationDataset(Dataset):
+    def __init__(self, data, split="train", val_split=0.2, seed=42):
+        n = data["n_samples"]
+        rng = np.random.default_rng(seed)
+        idx = rng.permutation(n)
+        split_n = int(n * (1 - val_split))
+        indices = idx[:split_n] if split == "train" else idx[split_n:]
+        self.images = data["images"][indices]
+        self.masks = data["masks"][indices]
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        return self.images[idx], self.masks[idx]
+
+def create_dataloaders(data, batch_size=16, val_split=0.2, seed=42):
+    train_ds = SegmentationDataset(data, "train", val_split, seed)
+    val_ds = SegmentationDataset(data, "val", val_split, seed)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size)
+    return train_loader, val_loader

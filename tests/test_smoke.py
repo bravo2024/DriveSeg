@@ -1,8 +1,42 @@
 from __future__ import annotations
 import sys; from pathlib import Path; sys.path.insert(0, str(Path(__file__).parent.parent))
-import numpy as np; from src.data import make_synthetic; from src.model import train_all_models, cross_validate
-def test_data(): d=make_synthetic(500); assert d["X"].shape[0]==500 and 0.02<d["positive_rate"]<0.5
-def test_train(): d=make_synthetic(300); b=train_all_models(d); assert len(b["models"])==4
-def test_xgb(): d=make_synthetic(300); assert train_all_models(d)["results"]["XGBoost"]["metrics"].get("roc_auc",0)>0.5
-def test_cv(): d=make_synthetic(400); cv=cross_validate(d,seed=42,n_folds=3); assert all(s["roc_auc"]["mean"]>0.5 for s in cv.values())
-def test_metrics(): d=make_synthetic(200); b=train_all_models(d); m=b["results"]["XGBoost"]["metrics"]; assert all(0<=m[k]<=1 for k in ["accuracy","precision","recall","f1"])
+import torch
+from src.data import make_synthetic, create_dataloaders, NUM_CLASSES
+from src.model import build_deeplab
+from src.core import compute_seg_metrics
+
+def test_data():
+    data = make_synthetic(50, seed=42)
+    assert data["images"].shape == (50, 3, 128, 128)
+    assert data["masks"].shape == (50, 128, 128)
+    assert data["num_classes"] == 4
+
+def test_dataloader():
+    data = make_synthetic(50, seed=42)
+    tl, vl = create_dataloaders(data, batch_size=16)
+    batch = next(iter(tl))
+    assert batch[0].shape == (16, 3, 128, 128)
+    assert batch[1].shape == (16, 128, 128)
+
+def test_model():
+    model = build_deeplab(num_classes=4, pretrained_backbone=False)
+    x = torch.randn(2, 3, 128, 128)
+    out = model(x)["out"]
+    assert out.shape == (2, 4, 128, 128)
+
+def test_metrics():
+    pred = torch.randint(0, 4, (10, 128, 128)).numpy()
+    true = torch.randint(0, 4, (10, 128, 128)).numpy()
+    m = compute_seg_metrics(pred, true, 4)
+    assert 0 <= m["miou"] <= 1
+    assert 0 <= m["dice"] <= 1
+    assert 0 <= m["pixel_acc"] <= 1
+
+def test_forward_pass():
+    model = build_deeplab(num_classes=4, pretrained_backbone=False)
+    model.eval()
+    with torch.no_grad():
+        out = model(torch.randn(1, 3, 128, 128))["out"]
+    pred = out.argmax(dim=1)
+    assert pred.shape == (1, 128, 128)
+    assert pred.min() >= 0 and pred.max() < 4
